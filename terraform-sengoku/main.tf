@@ -68,6 +68,7 @@ resource "aws_route_table_association" "public_2" {
   subnet_id      = aws_subnet.public_2.id
   route_table_id = aws_route_table.public.id
 }
+
 /*
 resource "aws_s3_bucket" "static" {
   bucket        = var.s3_bucket_name
@@ -99,6 +100,7 @@ resource "aws_s3_bucket_policy" "static" {
   depends_on = [aws_s3_bucket_public_access_block.static]
 }
 */
+
 resource "aws_security_group" "alb" {
   vpc_id = aws_vpc.main.id
 
@@ -165,33 +167,80 @@ resource "aws_db_subnet_group" "main" {
 }
 
 resource "aws_db_instance" "postgres" {
-  identifier              = "sengoku-db"
-  engine                  = "postgres"
-  engine_version          = "16"
-  instance_class          = "db.t3.micro"
-  allocated_storage       = 20
-  storage_type            = "gp2"
-  db_name                 = var.db_name
-  username                = var.db_username
-  password                = var.db_password
-  db_subnet_group_name    = aws_db_subnet_group.main.name
-  vpc_security_group_ids  = [aws_security_group.rds.id]
-  skip_final_snapshot     = true
-  publicly_accessible     = false
-  multi_az                = false
-  monitoring_interval     = 0
+  identifier             = "sengoku-db"
+  engine                 = "postgres"
+  engine_version         = "16"
+  instance_class         = "db.t3.micro"
+  allocated_storage      = 20
+  storage_type           = "gp2"
+  db_name                = var.db_name
+  username               = var.db_username
+  password               = var.db_password
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  skip_final_snapshot    = true
+  publicly_accessible    = false
+  multi_az               = false
+  monitoring_interval    = 0
 }
 
 locals {
   user_data = <<-EOF
     #!/bin/bash
+    set -e
+
     dnf update -y
-    dnf install -y docker postgresql15
+    dnf install -y docker git postgresql15
+
     systemctl enable docker
     systemctl start docker
-    curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+
+    mkdir -p /root/.docker/cli-plugins
+    curl -L "https://github.com/docker/buildx/releases/download/v0.17.1/buildx-v0.17.1.linux-amd64" -o /root/.docker/cli-plugins/docker-buildx
+    chmod +x /root/.docker/cli-plugins/docker-buildx
+
+    curl -L "https://github.com/docker/compose/releases/download/v2.29.1/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose
     chmod +x /usr/local/bin/docker-compose
+
     usermod -aG docker ec2-user
+
+    aws s3api head-bucket --bucket ${var.s3_bucket_name} 2>/dev/null || \
+      aws s3api create-bucket --bucket ${var.s3_bucket_name} --region ${var.aws_region} || true
+
+    aws s3api put-public-access-block \
+      --bucket ${var.s3_bucket_name} \
+      --public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false" || true
+
+    aws s3api put-bucket-policy \
+      --bucket ${var.s3_bucket_name} \
+      --policy '{"Version":"2012-10-17","Statement":[{"Sid":"PublicRead","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::${var.s3_bucket_name}/*"}]}' || true
+
+    cd /home/ec2-user
+    git clone https://github.com/Edin2753/ISO_Sengoku_PR2 app
+    cd app/pyapp
+
+    aws s3 sync /home/ec2-user/app/images/ s3://${var.s3_bucket_name}/images/ || true
+
+    export DB_HOST=${aws_db_instance.postgres.address}
+    export DB_NAME=${var.db_name}
+    export DB_USER=${var.db_username}
+    export DB_PASSWORD=${var.db_password}
+
+    docker-compose up -d --build
+
+    until PGPASSWORD=${var.db_password} psql \
+      -h ${aws_db_instance.postgres.address} \
+      -U ${var.db_username} \
+      -d ${var.db_name} \
+      -c '\q' 2>/dev/null; do
+      sleep 5
+    done
+
+    PGPASSWORD=${var.db_password} psql \
+      -h ${aws_db_instance.postgres.address} \
+      -U ${var.db_username} \
+      -d ${var.db_name} \
+      -f /home/ec2-user/app/pyapp/db/init.sql
   EOF
 }
 
@@ -203,6 +252,7 @@ resource "aws_instance" "ec2_1" {
   iam_instance_profile   = "LabInstanceProfile"
   key_name               = "vockey"
   user_data              = local.user_data
+  depends_on             = [aws_db_instance.postgres]
 
   tags = {
     Name = "sengoku-ec2-1"
